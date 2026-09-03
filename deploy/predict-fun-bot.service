@@ -1,0 +1,21 @@
+[Unit]
+Description=predict.fun AI trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+Environment=PATH=__APP_DIR__/.venv/bin:/usr/local/bin:/usr/bin
+# DRY RUN by default. Append --live ONLY after dry-run results look good.
+ExecStart=/usr/bin/node bot/predict-fun-bot.mjs
+Restart=always
+RestartSec=10
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

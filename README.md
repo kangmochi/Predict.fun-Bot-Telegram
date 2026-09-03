@@ -52,7 +52,7 @@ git --version
 **Clone repo dan pasang SDK resmi Predict.** SDK membutuhkan `ethers` v6 sebagai peer dependency ([docs](https://dev.predict.fun/how-to-create-or-cancel-orders-679306m0)).
 
 ```bash
-git clone https://github.com/USERNAME/NAMA_REPO.git predict-bot
+git clone https://github.com/kangmochi/Predict.fun-Bot-Telegram.git predict-bot
 cd predict-bot
 npm install @predictdotfun/sdk ethers
 npm install
@@ -145,6 +145,23 @@ Hasil di `data/ml/*.joblib` + `data/ml/meta.json`. `--check` menampilkan akurasi
 
 Tanpa langkah ini bot tetap jalan pakai indikator saja (`ML untrained` di log).
 
+---
+
+🧪 Tes Order $1 🧪
+
+**Wajib sebelum live.** Membeli satu tiket ±$1 di round yang sedang jalan.
+
+```bash
+node bot/predict-fun-bot.mjs --test-order
+```
+
+| Hasil | Arti |
+|---|---|
+| `TEST ORDER MASUK` | Wallet + IP lolos. Lanjut. |
+| `HTTP 403 … jurisdiction` | Region VPS ditolak. Ganti region. Jangan live. |
+
+---
+
 🚀 Jalankan 24/7 🚀
 
 ```bash
@@ -192,12 +209,13 @@ sudo systemctl start predict-fun-bot
 | `Cannot find module '@predictdotfun/sdk'` | `npm install @predictdotfun/sdk ethers` di folder repo. |
 | `HTTP 403 … jurisdiction` | IP VPS diblok. Pindah region, bukan VPN. |
 | `Privy wallet gas … top up` | Kirim ~0.01 BNB ke alamat signer, bukan alamat deposit. |
-| Telegram sepi berjam-jam | Cek `journalctl -f`. Banyak `PASS` = bot hidup dan menolak setup jelek. |
-| `Welcome to Ubuntu` muncul di log | SSH login ulang, bukan reboot. Cek `uptime`. |
-| Dua VPS sama-sama `--live` | Matikan salah satu. Satu wallet = satu bot. |
 | `No module named xgboost/lightgbm` | Aktifkan venv yang benar: `.venv/bin/python -m pip install lightgbm` dan `--no-deps xgboost`. |
 | `libgomp.so.1: cannot open shared object` | `sudo apt install -y libgomp1`, lalu latih ulang. |
 | `no trained models in data/ml` | Jalankan `npm run ml:train` sekali. |
+| Telegram sepi berjam-jam | Cek `journalctl -f`. Banyak `PASS` = bot hidup dan menolak setup jelek. |
+| `Welcome to Ubuntu` muncul di log | SSH login ulang, bukan reboot. Cek `uptime`. |
+| Dua VPS sama-sama `--live` | Matikan salah satu. Satu wallet = satu bot. |
+
 ---
 
 📜 Lisensi 📜

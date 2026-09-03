@@ -1,0 +1,23 @@
+{
+  "name": "predict-fun-bot",
+  "version": "1.0.0",
+  "description": "Autonomous predict.fun Crypto Up/Down trading bot with indicator + ML filters",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bot/predict-fun-bot.mjs",
+    "test": "node --test bot/predictfun/*.test.mjs",
+    "ml:train": "node bot/ml/run-train.mjs",
+    "reset-eval": "node bot/predict-fun-bot.mjs --reset-eval",
+    "check": "node bot/predict-fun-bot.mjs --check",
+    "dry-run": "node bot/predict-fun-bot.mjs --once",
+    "live": "node bot/predict-fun-bot.mjs --live"
+  },
+  "dependencies": {
+    "@predictdotfun/sdk": "^1.3.8",
+    "ethers": "^6.13.4"
+  }
+}

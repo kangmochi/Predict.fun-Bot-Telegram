@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — never commit real keys, tokens, or wallet material
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Runtime ledgers, trained models, archives
+data/
+
+# Editor / OS junk
+terminals/
+.DS_Store
