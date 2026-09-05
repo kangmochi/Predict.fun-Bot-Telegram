@@ -104,13 +104,23 @@ export async function placeBuyOrder({ market, outcome, price, stakeUsd }) {
   });
   const signedOrder = await builder.signTypedDataOrder(typedData);
   const hash = builder.buildTypedDataHash(typedData);
-
-  const result = await api.createOrder({
+  const payload = {
     order: { ...serializeOrder(signedOrder), hash },
     pricePerShare: pricePerShare.toString(),
     strategy: "LIMIT",
-  });
-  return { orderId: result.orderId, orderHash: result.orderHash };
+  };
+
+  try {
+    const result = await api.createOrder(payload);
+    return { orderId: result.orderId, orderHash: result.orderHash };
+  } catch (err) {
+    // JWT is minted once at process start and expires (~hours). Refresh and
+    // retry a single time so a stale session does not drop a live signal.
+    if (err.status !== 401) throw err;
+    await login();
+    const result = await api.createOrder(payload);
+    return { orderId: result.orderId, orderHash: result.orderHash };
+  }
 }
 
 /** USDT balance of the trading account, in USD units. */
