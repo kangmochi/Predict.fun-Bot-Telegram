@@ -1,0 +1,12 @@
+[Unit]
+Description=Notify Telegram when the mini PC LAN IP changes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Environment=IP_WATCH_DIR=__HOME__/labs/ip-watch
+Environment=IP_WATCH_ENV=__HOME__/labs/predict-fun-bot/.env
+Environment=IP_WATCH_IFACE=eno1
+ExecStart=__HOME__/labs/ip-watch/watch.sh

@@ -27,7 +27,8 @@ const DEFAULT_STATE = {
   lossStreak: 0, // consecutive losses (resets on a win)
   haltedUntilNextDay: false,
   tradesToday: 0,
-  realizedPnlUsd: 0,
+  realizedPnlUsd: 0, // today's PnL (fixed brain: zeroed at the midnight rollover)
+  lifetimePnlUsd: 0, // never reset, kept so the daily reset doesn't lose the total
   // Trades the bot has entered and is waiting on. Keyed by marketId.
   openTrades: {},
   // Closed/resolved trade log (most recent last).
@@ -74,23 +75,34 @@ export function evalQuotaReached(s = getState()) {
   return Boolean(s.haltedUntilNextDay || s.tradesToday >= cap);
 }
 
-/** Stamp the calendar day for display; do not reset eval quotas at midnight. */
+/**
+ * New calendar day in BOT_TIMEZONE. With a fixed brain (LLM_PROVIDER != auto)
+ * the daily quota, the loss-streak halt and the daily PnL reset here. Auto-rotation keeps
+ * eval rounds across midnight instead (rotation.mjs handles those resets).
+ */
 export function rolloverIfNewDay() {
   const today = tradingDay();
-  if (state.day !== today) {
-    state.day = today;
-    saveState();
+  if (state.day === today) return;
+  state.day = today;
+  if (config.llmMode !== "auto") {
+    state.tradesToday = 0;
+    state.lossStreak = 0;
+    state.haltedUntilNextDay = false;
+    state.realizedPnlUsd = 0;
   }
+  saveState();
 }
 
 /** Whether the bot is allowed to open new positions right now. */
 export function tradingAllowed() {
   rolloverIfNewDay();
   if (state.haltedUntilNextDay) {
-    return { allowed: false, reason: `circuit breaker: ${state.lossStreak} losses in a row — this brain's round is done` };
+    const until = config.llmMode === "auto" ? "this brain's round is done" : `paused until midnight ${S.timezone}`;
+    return { allowed: false, reason: `circuit breaker: ${state.lossStreak} losses in a row — ${until}` };
   }
   if (state.tradesToday >= S.maxDailyTrades) {
-    return { allowed: false, reason: `eval round cap reached (${S.maxDailyTrades})` };
+    const until = config.llmMode === "auto" ? "eval round cap" : `daily cap, resets midnight ${S.timezone}`;
+    return { allowed: false, reason: `${until} reached (${state.tradesToday}/${S.maxDailyTrades})` };
   }
   if (Object.keys(state.openTrades).length >= S.maxOpenPositions) {
     return { allowed: false, reason: `max open positions reached (${S.maxOpenPositions})` };
@@ -144,12 +156,41 @@ export function decideEntry({ probabilityYes, confidence, favored }, { yesAsk, n
     return { skip: `leader ${favored ?? side} @ ${entryPrice} outside sane band [${S.priceBandMin}, ${S.priceBandMax}]` };
   }
 
-  const tier = confidence >= S.highConfThreshold ? "high" : "base";
-  const { base, high } = currentStakes();
-  const rawStake = tier === "high" ? high : base;
+  const locked = favored === "UP" || favored === "DOWN" || favored === "YES" || favored === "NO";
+  const isCheap =
+    S.cheapEdge &&
+    locked &&
+    entryPrice <= S.cheapAskMax &&
+    edge >= S.cheapEdgeMin;
+
+  let limitPrice = entryPrice;
+  let paidEdge = edge;
+  if (isCheap && S.cheapTakeCents > 0) {
+    const crossed = Math.min(Number((entryPrice + S.cheapTakeCents).toFixed(4)), S.priceBandMax);
+    const crossedEdge = (side === "YES" ? probabilityYes : 1 - probabilityYes) - crossed;
+    if (crossed >= S.priceBandMin && crossedEdge >= S.minEdge) {
+      limitPrice = crossed;
+      paidEdge = crossedEdge;
+    }
+  }
+
+  const { base, high, cheap } = currentStakes();
+  let tier = confidence >= S.highConfThreshold ? "high" : "base";
+  let rawStake = tier === "high" ? high : base;
+  if (isCheap) {
+    tier = "cheap";
+    rawStake = cheap;
+  }
   const stakeUsd = Math.min(rawStake, S.maxStakeUsd);
 
-  return { side, stakeUsd: Number(stakeUsd.toFixed(2)), edge, tier };
+  return {
+    side,
+    stakeUsd: Number(stakeUsd.toFixed(2)),
+    edge: paidEdge,
+    tier,
+    price: limitPrice,
+    ask: entryPrice,
+  };
 }
 
 /** Live USDT if BANKROLL_LIVE is on, else BANKROLL_USD. Size compounds with the wallet. */
@@ -165,12 +206,15 @@ export function currentStakes() {
   }
   base = Math.min(base, S.maxStakeUsd);
   let high = Math.min(S.maxStakeUsd, Math.max((bankroll * S.highConfStakePct) / 100, base));
+  const cheapPct = S.cheapEdgeStakePct > 0 ? S.cheapEdgeStakePct : S.highConfStakePct;
+  let cheap = Math.min(S.maxStakeUsd, Math.max((bankroll * cheapPct) / 100, high));
   if (useLive) {
     const payable = Math.max(0, bankroll * 0.9);
     base = Math.min(base, payable);
     high = Math.min(high, payable);
+    cheap = Math.min(cheap, payable);
   }
-  return { bankroll, base, high, live: useLive };
+  return { bankroll, base, high, cheap, live: useLive };
 }
 
 /** Record a newly entered trade (real or simulated). */
@@ -185,17 +229,52 @@ export function hasOpenTrade(marketId) {
 }
 
 /**
+ * Append one settled trade to the durable JSONL log. Failures never block
+ * settlement — the ledger stays the source of truth for the circuit breaker.
+ */
+export function appendTradeLog(row, file = config.tradesLog) {
+  if (!file) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${JSON.stringify(row)}\n`);
+    return true;
+  } catch (err) {
+    console.log(`[ledger] trade log append failed (${err.message})`);
+    return false;
+  }
+}
+
+/**
+ * Drop an open LIMIT that never filled. No PnL, no streak, no trades.jsonl.
+ * Refunds today's trade slot so an unfilled rest does not eat the daily cap.
+ */
+export function abandonTrade(marketId, { reason } = {}) {
+  getState();
+  const trade = state.openTrades[marketId];
+  if (!trade) return null;
+  delete state.openTrades[marketId];
+  if (state.tradesToday > 0) state.tradesToday -= 1;
+  saveState();
+  return { ...trade, voidedAt: new Date().toISOString(), voidReason: reason || "unfilled" };
+}
+
+/**
  * Settle a tracked trade as a win or a loss. Updates the streak and trips the
  * circuit breaker when needed. Returns { halted: boolean }.
  */
-export function settleTrade(marketId, { won, pnlUsd }) {
+export function settleTrade(marketId, { won, pnlUsd, filledUsd, fillSource } = {}) {
   const trade = state.openTrades[marketId];
   if (!trade) return { halted: false };
 
   delete state.openTrades[marketId];
-  state.history.push({ ...trade, settledAt: new Date().toISOString(), won, pnlUsd });
+  const settled = { ...trade, settledAt: new Date().toISOString(), won, pnlUsd };
+  if (Number.isFinite(filledUsd)) settled.filledUsd = Number(filledUsd);
+  if (fillSource) settled.fillSource = fillSource;
+  state.history.push(settled);
   if (state.history.length > 500) state.history = state.history.slice(-500);
+  appendTradeLog(settled);
   state.realizedPnlUsd = Number((state.realizedPnlUsd + pnlUsd).toFixed(2));
+  state.lifetimePnlUsd = Number(((state.lifetimePnlUsd ?? 0) + pnlUsd).toFixed(2));
 
   if (won) {
     state.lossStreak = 0;

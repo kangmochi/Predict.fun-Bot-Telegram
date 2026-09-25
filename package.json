@@ -1,7 +1,7 @@
 {
-  "name": "predict-fun-bot",
+  "name": "predict-telegram-bot",
   "version": "1.0.0",
-  "description": "Autonomous predict.fun Crypto Up/Down trading bot with indicator + ML filters",
+  "description": "Telegram bot for PancakeSwap Prediction (BNB Chain mainnet) with a --check diagnostics mode",
   "type": "module",
   "private": true,
   "engines": {
@@ -11,10 +11,12 @@
     "start": "node bot/predict-fun-bot.mjs",
     "test": "node --test bot/predictfun/*.test.mjs",
     "ml:train": "node bot/ml/run-train.mjs",
+    "ml:report": "node bot/ml/run-report.mjs",
     "reset-eval": "node bot/predict-fun-bot.mjs --reset-eval",
     "check": "node bot/predict-fun-bot.mjs --check",
     "dry-run": "node bot/predict-fun-bot.mjs --once",
-    "live": "node bot/predict-fun-bot.mjs --live"
+    "live": "node bot/predict-fun-bot.mjs --live",
+    "telegram-info-bot": "node bot/predict-telegram-bot.mjs"
   },
   "dependencies": {
     "@predictdotfun/sdk": "^1.3.8",

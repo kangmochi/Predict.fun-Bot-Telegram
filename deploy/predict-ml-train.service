@@ -1,0 +1,15 @@
+[Unit]
+Description=predict.fun ML ensemble weekly train
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=-__APP_DIR__/.env
+Environment=ML_DAYS=60
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=__APP_DIR__/deploy/ml-train.sh

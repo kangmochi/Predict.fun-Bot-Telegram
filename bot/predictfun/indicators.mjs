@@ -53,6 +53,62 @@ export function rsi(closes, period = 14) {
   return 100 - 100 / (1 + gain / loss);
 }
 
+/** Average True Range as a percent of last close. */
+export function atrPct(highs, lows, closes, period = 14) {
+  if (!closes.length || closes.length < period + 1) return null;
+  const ranges = [];
+  for (let i = 1; i < closes.length; i++) {
+    ranges.push(trueRange(highs[i], lows[i], closes[i - 1]));
+  }
+  const avg = sma(ranges, Math.min(period, ranges.length));
+  const close = closes[closes.length - 1];
+  if (avg == null || !close) return null;
+  return (avg / close) * 100;
+}
+
+/**
+ * Wilder ADX (default 14). Needs ~2×period bars. Null if the series is too short.
+ */
+export function adx(highs, lows, closes, period = 14) {
+  const n = closes.length;
+  if (n < period * 2) return null;
+  const tr = [];
+  const plusDM = [];
+  const minusDM = [];
+  for (let i = 1; i < n; i++) {
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
+    plusDM.push(up > down && up > 0 ? up : 0);
+    minusDM.push(down > up && down > 0 ? down : 0);
+    tr.push(trueRange(highs[i], lows[i], closes[i - 1]));
+  }
+  if (tr.length < period * 2 - 1) return null;
+  let atr = 0;
+  let p = 0;
+  let m = 0;
+  for (let i = 0; i < period; i++) {
+    atr += tr[i];
+    p += plusDM[i];
+    m += minusDM[i];
+  }
+  const dxs = [];
+  for (let i = period; i < tr.length; i++) {
+    atr = atr - atr / period + tr[i];
+    p = p - p / period + plusDM[i];
+    m = m - m / period + minusDM[i];
+    const plusDI = atr > 0 ? (100 * p) / atr : 0;
+    const minusDI = atr > 0 ? (100 * m) / atr : 0;
+    const den = plusDI + minusDI;
+    dxs.push(den > 0 ? (100 * Math.abs(plusDI - minusDI)) / den : 0);
+  }
+  if (dxs.length < period) return null;
+  let val = 0;
+  for (let i = 0; i < period; i++) val += dxs[i];
+  val /= period;
+  for (let i = period; i < dxs.length; i++) val = (val * (period - 1) + dxs[i]) / period;
+  return val;
+}
+
 export function macd(closes, fast = 12, slow = 26, signalPeriod = 9) {
   const fastE = emaSeries(closes, fast);
   const slowE = emaSeries(closes, slow);

@@ -1,0 +1,10 @@
+[Unit]
+Description=Train predict.fun ML ensemble every Sunday after Jakarta midnight
+
+[Timer]
+OnCalendar=Sun *-*-* 01:15:00
+Persistent=true
+Unit=predict-ml-train.service
+
+[Install]
+WantedBy=timers.target

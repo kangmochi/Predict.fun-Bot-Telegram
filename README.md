@@ -12,7 +12,7 @@
 
 ⭐ Ringkasan ⭐
 
-Bot ini memindai pasar [predict.fun](https://predict.fun) setiap 2 menit, membaca candle dan order book Binance, lalu hanya membeli sisi yang lolos filter **EMA · RSI · MACD · volume · spread** dan (opsional) ensemble **XGBoost · LightGBM · Random Forest · Logistic**. LLM tidak boleh melawan arah filter. Order dikirim lewat SDK resmi Predict sebagai **limit order** — tidak makan BNB per transaksi.
+Bot ini memindai pasar [predict.fun](https://predict.fun) setiap 2 menit, membaca candle Binance (1m untuk ML, 5m/15m/60m untuk gate), lalu hanya membeli sisi yang lolos gate **spreadsheet MTF** — ADX 60m ≥ 20, bias 5m = 15m = 60m, ATR% 5m di pita wajar, volume (BNB lebih ketat), plus spread dan **no-fade** — lalu (opsional) ensemble **XGBoost · LightGBM · Random Forest · Logistic**. LLM tidak boleh melawan arah filter. Kalau leader sudah murah (ask ≤ 30¢ dan edge ≥ 20¢) tiket naik ke ~12% saldo live dan LIMIT disilang +1¢ supaya mengambil buku — tetap sisi strike, bukan fade. Order dikirim lewat SDK resmi Predict sebagai **limit order** — tidak makan BNB per transaksi. `MTF_GATE=off` mengembalikan vote 1m EMA/RSI/MACD/BOOK ≥ 3/4.
 
 1. **Siapkan** VPS Ubuntu 24.04 (2 vCPU / 2 GB) di region yang **diizinkan** predict.fun.
 2. **Pasang** Node.js dan SDK resmi.
@@ -145,6 +145,22 @@ Hasil di `data/ml/*.joblib` + `data/ml/meta.json`. `--check` menampilkan akurasi
 
 Tanpa langkah ini bot tetap jalan pakai indikator saja (`ML untrained` di log).
 
+**Validasi jujur.** Hold-out adalah 20% candle **terbaru** lintas aset (bukan acak), ditambah walk-forward 4 lipatan (`ML_WF_FOLDS`). Probabilitas dikalibrasi (`ML_CALIBRATE=off` untuk mematikan) supaya `ML_MIN_PROBA=0.55` benar-benar berarti 55%.
+
+**Belajar dari trade nyata.** Setiap entry menyimpan fitur indikator, suara ML, harga tiket, aset, dan durasi round. Saat settle, baris lengkap ditambahkan ke `data/trades.jsonl` (append-only, tidak pernah dipangkas). `npm run ml:train` otomatis:
+
+1. menilai model sintetis pada trade nyata secara out-of-sample (`real trades (out-of-sample)` di log, mulai ≥30 baris), lalu
+2. mencampur baris nyata ke fit akhir dengan bobot `ML_REAL_WEIGHT` (default 3).
+
+Lihat di mana edge-nya:
+
+```bash
+npm run ml:report          # trade live saja
+npm run ml:report -- --sim # termasuk dry-run
+```
+
+Laporan memecah winrate/PnL per harga tiket, durasi (5m/15m/1h/harian), aset, jam ET, hari, brain, kesepakatan indikator/ML, dan tabel kalibrasi ML (p rata-rata vs hasil nyata). Bagian **Findings** menandai bucket yang lemah (edge < −5 poin) dan ML yang over-confident.
+
 ---
 
 🧪 Tes Order $1 🧪
@@ -175,6 +191,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now predict-fun-bot
 ```
 
+Feed harga: Binance dipanggil dengan timeout 4 detik, host yang hidup dipakai dulu, buku/depth boleh gagal (candle tetap cukup). Kalau semua host Binance blip, snapshot <90 detik dipakai ulang; sesudah itu Bybit publik. `analysis failed All Binance hosts` hanya muncul jika ketiganya gagal. Bankroll BSC yang 524/timeout tidak membatalkan siklus — RPC cadangan dicoba, saldo live terakhir tetap dipakai.
+
 Pantau log (Ctrl+C hanya menutup log, bot tetap jalan):
 
 ```bash
@@ -195,8 +213,13 @@ sudo systemctl start predict-fun-bot
 | Yang terlihat | Arti |
 |---|---|
 | `PASS "…"` | Filter menolak round ini. Normal, bisa berjam-jam. |
-| `ORDER PLACED` | Order masuk, USDT terpotong. |
-| `WIN` / `LOSS` di Telegram | Round selesai menurut harga tutup. |
+| `PASS … adx_ok` | 60m sideways (ADX < 20). |
+| `PASS … mtf_aligned` | Arah 5m / 15m / 60m tidak sama. |
+| `PASS … volatility_ok` / `volume_ok` | ATR% 5m di luar pita, atau volume 5m tipis. |
+| `ORDER PLACED [CHEAP EDGE]` | Leader murah (≤30¢) + edge gemuk — tiket lebih besar, LIMIT +1¢. |
+| `ORDER PLACED` | Limit **masuk buku**, belum tentu terisi. Cek Open Orders di web. |
+| `VOID (tidak terisi)` | Limit 0 fill sampai round tutup. **Bukan** WIN/LOSS, PnL tidak berubah. |
+| `WIN` / `LOSS` di Telegram | Round selesai **dan ada fill**. PnL dihitung dari shares terisi. |
 | Website masih **Sell** | Market harian belum tutup (tengah malam ET). |
 | History **Claimed** kosong | Bot tidak menekan Claim. Itu berbeda dari ledger bot. |
 

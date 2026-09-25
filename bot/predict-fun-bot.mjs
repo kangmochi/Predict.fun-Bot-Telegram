@@ -25,11 +25,13 @@ import process from "node:process";
 import { applyLlmProvider, config, hasAnyLlmKey, hasLlmKey, providerHasKey } from "./predictfun/config.mjs";
 import * as api from "./predictfun/api.mjs";
 import { analyzeMarket, analyzeCryptoUpDown, probeLlm } from "./predictfun/llm.mjs";
-import { getPriceContext, probeBinance } from "./predictfun/pricefeed.mjs";
+import { getPriceContext, getMtfFrames, probeBinance } from "./predictfun/pricefeed.mjs";
+import { sheetGate } from "./predictfun/mtf.mjs";
 import * as strategy from "./predictfun/strategy.mjs";
 import * as rotation from "./predictfun/rotation.mjs";
 import { indicatorGate, alignWithIndicators, mlEnsembleGate } from "./predictfun/discipline.mjs";
 import { mlFeatures, modelsReady, readMeta, resolvePython, scoreFeatures } from "./predictfun/ml.mjs";
+import { asList, fromTokenAmount, isDustFill, resolveFilledStake, shouldVoid } from "./predictfun/fills.mjs";
 
 const argv = new Set(process.argv.slice(2));
 const LIVE = argv.has("--live");
@@ -65,14 +67,24 @@ function rotationSwitchMessage(rot) {
 async function notify(text) {
   log(text.replaceAll("\n", " | "));
   if (!config.telegramToken || !config.telegramChatId) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${config.telegramToken}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: config.telegramChatId, text }),
-    });
-  } catch (err) {
-    log(`Telegram notify failed: ${err.message}`);
+  const url = `https://api.telegram.org/bot${config.telegramToken}/sendMessage`;
+  const payload = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: config.telegramChatId, text }),
+  };
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, payload);
+      if (res.ok) return;
+      const body = await res.text();
+      lastErr = `HTTP ${res.status} ${body.slice(0, 300)}`;
+    } catch (err) {
+      lastErr = err.message;
+    }
+    log(`Telegram notify failed (try ${attempt}/3): ${lastErr}`);
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 1500 * attempt));
   }
 }
 
@@ -168,6 +180,29 @@ function parseCloseTimeMs(title, referenceYear = new Date().getFullYear()) {
   return times.length === 1 ? epoch + 60 * 60 * 1000 : epoch;
 }
 
+/** { xgboost: { side, p, ready } } → { xgboost: 0.62 } (only models that scored). */
+function compactVotes(votes) {
+  const out = {};
+  for (const [name, v] of Object.entries(votes ?? {})) {
+    if (v && v.ready && v.p != null) out[name] = Number(v.p);
+  }
+  return out;
+}
+
+/** Round length in minutes from the title: "3:10PM-3:15PM ET" → 5, "3PM ET" → 60, daily → 1440. */
+function roundHorizonMin(title) {
+  const times = [...String(title).matchAll(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/gi)];
+  if (times.length === 0) return 1440;
+  if (times.length === 1) return 60;
+  const toMin = (m) => {
+    let hour = Number(m[1]) % 12;
+    if (m[3].toUpperCase() === "PM") hour += 12;
+    return hour * 60 + (m[2] ? Number(m[2]) : 0);
+  };
+  const diff = toMin(times[times.length - 1]) - toMin(times[0]);
+  return diff > 0 ? diff : diff + 24 * 60;
+}
+
 /** A crypto round we can trade: live, strike set, not yet ended, priced. */
 function tradableCryptoRound(market) {
   const d = cryptoDetails(market);
@@ -191,8 +226,46 @@ function tradableCryptoRound(market) {
 // Settlement: check tracked trades against resolved markets
 // ---------------------------------------------------------------------------
 
+async function withAuthRetry(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err.status !== 401) throw err;
+    const { login } = await import("./predictfun/executor.mjs");
+    await login();
+    return await fn();
+  }
+}
+
+async function loadFillSnapshot(trade) {
+  try {
+    const hashed = trade?.orderHash
+      ? await withAuthRetry(() => api.getOrderByHash(trade.orderHash)).catch((err) => {
+          log(`settle: getOrderByHash ${String(trade.orderHash).slice(0, 10)}… ${err.message}`);
+          return null;
+        })
+      : null;
+    const [filledOrders, openOrders, positions] = await withAuthRetry(async () => {
+      const [filled, open, pos] = await Promise.all([
+        api.getMyOrders({ status: "FILLED", first: 50 }),
+        api.getMyOrders({ status: "OPEN", first: 50 }),
+        api.getPositions({ marketId: trade?.marketId, first: 50 }),
+      ]);
+      return [filled, open, pos];
+    });
+    const orders = [...asList(hashed ? [hashed] : []), ...asList(filledOrders), ...asList(openOrders)];
+    return { orders, positions, ok: true };
+  } catch (err) {
+    log(`settle: orders/positions fetch failed (${err.message})`);
+    return { orders: [], positions: [], ok: false };
+  }
+}
+
 async function settleResolvedTrades() {
   const open = { ...strategy.getState().openTrades };
+  const ids = Object.keys(open);
+  if (ids.length === 0) return;
+
   for (const [marketId, trade] of Object.entries(open)) {
     let market;
     try {
@@ -205,8 +278,6 @@ async function settleResolvedTrades() {
     if (market?.resolution) {
       won = String(market.resolution.onChainId) === String(trade.tokenId);
     } else {
-      // Crypto rounds: settle as soon as the end price is published, without
-      // waiting for the on-chain resolution to finalize.
       const d = cryptoDetails(market ?? {});
       if (d && d.endPrice != null && d.startPrice != null && d.endPrice !== d.startPrice) {
         const upWon = d.endPrice > d.startPrice;
@@ -214,14 +285,50 @@ async function settleResolvedTrades() {
       }
     }
     if (won === null) continue;
-    const pnlUsd = won
-      ? Number((trade.stakeUsd * (1 / trade.price - 1)).toFixed(2))
-      : -trade.stakeUsd;
 
-    const { halted } = strategy.settleTrade(marketId, { won, pnlUsd });
+    let filledUsd = Number(trade.stakeUsd) || 0;
+    let fillSource = trade.dryRun ? "sim" : "assumed";
+    if (LIVE && !trade.dryRun) {
+      const fills = await loadFillSnapshot(trade);
+      if (!fills.ok) {
+        log(`settle: skip "${trade.title}" — cannot confirm fill yet`);
+        continue;
+      }
+      const got = resolveFilledStake(trade, fills);
+      filledUsd = got.filledUsd;
+      fillSource = got.source;
+      if (shouldVoid(got)) {
+        strategy.abandonTrade(marketId, { reason: `unfilled (${fillSource}/${got.status})` });
+        log(`VOID unfilled "${trade.title}" — 0 fill (${fillSource} ${got.status}), not booked in PnL`);
+        await notify(
+          `⚪ VOID (tidak terisi) "${trade.title}"\n` +
+            `Limit ${trade.side} @ ${trade.price} · $${trade.stakeUsd} status ${got.status || "—"}. ` +
+            `Bukan WIN/LOSS — PnL dan circuit breaker tidak berubah.\n` +
+            strategy.statusLine(),
+        );
+        continue;
+      }
+      if (!got.confirmed || isDustFill(filledUsd)) {
+        log(`settle: skip "${trade.title}" — fill unconfirmed (${got.source} ${got.status || ""} filled=$${Number(filledUsd).toFixed(2)})`);
+        continue;
+      }
+    }
+
+    const pnlUsd = won
+      ? Number((filledUsd * (1 / trade.price - 1)).toFixed(2))
+      : Number((-filledUsd).toFixed(2));
+
+    const { halted } = strategy.settleTrade(marketId, {
+      won,
+      pnlUsd,
+      filledUsd,
+      fillSource,
+    });
     await notify(
       `${won ? "🟢 WIN" : "🔴 LOSS"} ${trade.dryRun ? "[SIM] " : ""}"${trade.title}"\n` +
-        `Side: ${trade.side} @ ${trade.price} · stake $${trade.stakeUsd} · PnL ${pnlUsd >= 0 ? "+" : ""}$${pnlUsd}\n` +
+        `Side: ${trade.side} @ ${trade.price} · stake $${Number(filledUsd).toFixed(2)}` +
+        (Math.abs(filledUsd - Number(trade.stakeUsd)) > 0.02 ? ` (of $${trade.stakeUsd})` : "") +
+        ` · PnL ${pnlUsd >= 0 ? "+" : ""}$${pnlUsd}\n` +
         strategy.statusLine(),
     );
     if (halted) {
@@ -237,14 +344,57 @@ async function settleResolvedTrades() {
 // One scan cycle
 // ---------------------------------------------------------------------------
 
+async function reattachFilledPositions() {
+  if (!LIVE) return 0;
+  let positions;
+  try {
+    positions = await withAuthRetry(() => api.getPositions({ first: 50 }));
+  } catch (err) {
+    log(`reattach: positions fetch failed (${err.message})`);
+    return 0;
+  }
+  const s = strategy.getState();
+  const histIds = new Set((s.history || []).map((t) => String(t.marketId)));
+  let n = 0;
+  for (const pos of asList(positions)) {
+    const market = pos.market || {};
+    const id = String(market.id ?? pos.marketId ?? "");
+    if (!id || strategy.hasOpenTrade(id) || histIds.has(id)) continue;
+    const shares = fromTokenAmount(pos.amount);
+    const avg = Number(pos.averageBuyPriceUsd);
+    if (!Number.isFinite(shares) || shares < 0.05 || !Number.isFinite(avg) || avg <= 0) continue;
+    const name = String(pos.outcome?.name ?? "");
+    const side = /up/i.test(name) ? "UP" : /down/i.test(name) ? "DOWN" : null;
+    if (!side) continue;
+    const stake = Number((shares * avg).toFixed(2));
+    if (stake < 0.05) continue;
+    strategy.recordEntry({
+      marketId: id,
+      title: market.title || id,
+      side,
+      outcomeName: name,
+      tokenId: String(pos.outcome?.onChainId ?? ""),
+      price: avg,
+      stakeUsd: stake,
+      dryRun: false,
+      llmProvider: config.llmProvider,
+      revived: true,
+    });
+    n += 1;
+    log(`reattach filled position "${market.title}" ${side} ${shares.toFixed(2)} sh @ ${avg} ~$${stake}`);
+  }
+  return n;
+}
+
 async function settleEveryLedger() {
-  const names = rotation.isAuto()
-    ? config.llmRotation.filter((name) => providerHasKey(name))
-    : [config.llmProvider];
+  // Every brain's ledger, not only the active one: trades opened under a
+  // previous LLM must still report WIN/LOSS after a provider switch.
+  const names = [...new Set([...config.llmRotation.filter((name) => providerHasKey(name)), config.llmProvider])];
   const current = config.llmProvider;
   for (const name of names) {
     applyLlmProvider(name);
     strategy.loadState();
+    if (LIVE && name === current) await reattachFilledPositions();
     await settleResolvedTrades();
   }
   applyLlmProvider(current);
@@ -261,7 +411,9 @@ async function refreshLiveBankroll() {
       log(`live bankroll $${usd.toFixed(2)} USDT → base $${strategy.currentStakes().base.toFixed(2)} / high $${strategy.currentStakes().high.toFixed(2)}`);
     }
   } catch (err) {
-    log(`live bankroll fetch failed (${err.message}) — fallback BANKROLL_USD=$${config.strategy.bankrollUsd}`);
+    const last = config.strategy.liveBankrollUsd;
+    const keep = Number.isFinite(last) ? `keep last live $${Number(last).toFixed(2)}` : `fallback BANKROLL_USD=$${config.strategy.bankrollUsd}`;
+    log(`live bankroll fetch failed (${err.message}) — ${keep}`);
   }
 }
 
@@ -321,6 +473,9 @@ async function scanCycle() {
 
     let analysis;
     let extraInfo = "";
+    // Entry context saved with the trade so the ML can later learn from real
+    // WIN/LOSS rows (data/trades.jsonl) instead of synthetic candles only.
+    let entryCtx = null;
     try {
       if (isCrypto) {
         const d = cryptoDetails(market);
@@ -333,13 +488,28 @@ async function scanCycle() {
         const priceCtx = await getPriceContext(d.priceFeedSymbol);
         const gapPct = ((priceCtx.currentPrice - d.startPrice) / d.startPrice) * 100;
         extraInfo = `strike ${d.startPrice} · now ${priceCtx.currentPrice} (${gapPct >= 0 ? "+" : ""}${gapPct.toFixed(3)}%) · ${minutesRemaining === null ? "?" : minutesRemaining.toFixed(0)}m left`;
-        const gate = indicatorGate({
-          snapshot: priceCtx.snapshot,
-          startPrice: d.startPrice,
-          currentPrice: priceCtx.currentPrice,
-          upAsk: yesAsk,
-          downAsk: noAsk,
-        });
+        if (priceCtx.fromCache) extraInfo += ` · feed cache ${priceCtx.cacheAgeSec}s`;
+        else if (priceCtx.venue && priceCtx.venue !== "binance") extraInfo += ` · feed ${priceCtx.venue}`;
+        let gate;
+        if (config.strategy.mtfGate) {
+          const frames = await getMtfFrames(d.priceFeedSymbol);
+          gate = sheetGate({
+            frames,
+            startPrice: d.startPrice,
+            currentPrice: priceCtx.currentPrice,
+            upAsk: yesAsk,
+            downAsk: noAsk,
+            symbol: d.priceFeedSymbol,
+          });
+        } else {
+          gate = indicatorGate({
+            snapshot: priceCtx.snapshot,
+            startPrice: d.startPrice,
+            currentPrice: priceCtx.currentPrice,
+            upAsk: yesAsk,
+            downAsk: noAsk,
+          });
+        }
         extraInfo += ` · ${gate.line}`;
         if (gate.skip) {
           log(`PASS "${market.title}" — ${extraInfo} → ${gate.skip}`);
@@ -354,15 +524,14 @@ async function scanCycle() {
           );
           continue;
         }
-        const mlScore = await scoreFeatures(
-          mlFeatures({
-            snapshot: priceCtx.snapshot,
-            startPrice: d.startPrice,
-            currentPrice: priceCtx.currentPrice,
-            minutesRemaining: minutesRemaining ?? 30,
-            priceCtx,
-          }),
-        );
+        const features = mlFeatures({
+          snapshot: priceCtx.snapshot,
+          startPrice: d.startPrice,
+          currentPrice: priceCtx.currentPrice,
+          minutesRemaining: minutesRemaining ?? 30,
+          priceCtx,
+        });
+        const mlScore = await scoreFeatures(features);
         const mlGate = mlScore.ready
           ? mlEnsembleGate({
               votes: mlScore.votes,
@@ -390,6 +559,22 @@ async function scanCycle() {
           log(`PASS "${market.title}" — ${extraInfo} → ${aligned.skip}`);
           continue;
         }
+        entryCtx = {
+          asset: d.priceFeedSymbol,
+          horizonMin: roundHorizonMin(market.title),
+          minutesRemaining: minutesRemaining == null ? null : Number(minutesRemaining.toFixed(2)),
+          startPrice: d.startPrice,
+          entryPrice: priceCtx.currentPrice,
+          upAsk: yesAsk,
+          downAsk: noAsk,
+          indicatorAgree: gate.agree,
+          indicatorConfidence: gate.confidence,
+          llmRawP: aligned.rawP,
+          mlVotes: compactVotes(mlScore.votes),
+          mlAgree: mlGate.agree ?? 0,
+          mlAgainst: mlGate.against ?? 0,
+          features,
+        };
         analysis = {
           probabilityYes: aligned.probabilityYes,
           confidence: aligned.confidence,
@@ -414,7 +599,7 @@ async function scanCycle() {
     }
 
     const outcome = decision.side === "YES" ? outcomeA : outcomeB;
-    const price = decision.side === "YES" ? yesAsk : noAsk;
+    const price = decision.price ?? (decision.side === "YES" ? yesAsk : noAsk);
 
     const trade = {
       marketId: String(market.id),
@@ -429,6 +614,8 @@ async function scanCycle() {
       probabilityYes: analysis.probabilityYes,
       dryRun: !LIVE,
       llmProvider: config.llmProvider,
+      llmModel: config.llmModel,
+      ...(entryCtx ? { entry: entryCtx } : {}),
     };
 
     if (LIVE) {
@@ -452,10 +639,20 @@ async function scanCycle() {
 
     strategy.recordEntry(trade);
     await notify(
-      `${LIVE ? "🎯 ORDER PLACED" : "🧪 SIMULATED ENTRY"} [${trade.tier === "high" ? `HIGH CONF ≥${config.strategy.highConfThreshold * 100}%` : "base"}]\n` +
+      `${LIVE ? "🎯 ORDER PLACED (limit di buku, belum tentu terisi)" : "🧪 SIMULATED ENTRY"} [${
+        trade.tier === "cheap"
+          ? `CHEAP EDGE ≤${config.strategy.cheapAskMax * 100}¢`
+          : trade.tier === "high"
+            ? `HIGH CONF ≥${config.strategy.highConfThreshold * 100}%`
+            : "base"
+      }]\n` +
         `"${market.title}"\n` +
         (extraInfo ? `${extraInfo}\n` : "") +
-        `Buy ${outcome.name} @ ${price} · stake $${decision.stakeUsd} · edge +${(decision.edge * 100).toFixed(1)}c\n` +
+        `Buy ${outcome.name} @ ${price}` +
+        (decision.ask != null && decision.ask !== price
+          ? ` (ask ${decision.ask} +${(config.strategy.cheapTakeCents * 100).toFixed(0)}¢)`
+          : "") +
+        ` · stake $${decision.stakeUsd} · edge +${(decision.edge * 100).toFixed(1)}c\n` +
         `LLM: P=${probPct}% conf=${confPct}%\n${analysis.reasoning.slice(0, 300)}\n` +
         strategy.statusLine(),
     );
@@ -647,7 +844,8 @@ async function runCheck() {
   console.log(
     `   bankroll $${stakes.bankroll.toFixed(2)}${stakes.live ? " live USDT" : ` (BANKROLL_USD fallback; live ${S.bankrollLive ? "on" : "off"})`} · ` +
       `base $${stakes.base.toFixed(2)} (${S.baseStakePct}% of live, floor $${S.baseStakeUsd}) · ` +
-      `high-conf ≥${S.highConfThreshold * 100}% → ${S.highConfStakePct}% ($${stakes.high.toFixed(2)}) · cap $${S.maxStakeUsd}`,
+      `high-conf ≥${S.highConfThreshold * 100}% → ${S.highConfStakePct}% ($${stakes.high.toFixed(2)}) · ` +
+      `cheap-edge ≤${S.cheapAskMax * 100}¢ / ≥${S.cheapEdgeMin * 100}c → ${S.cheapEdgeStakePct}% ($${stakes.cheap.toFixed(2)}) · cap $${S.maxStakeUsd}`,
   );
   console.log(`   min confidence ${S.minConfidence * 100}% · min edge ${S.minEdge * 100}c · entry price ${S.priceBandMin}–${S.priceBandMax} · stop after ${S.maxLossStreak} straight losses (day = ${S.timezone})`);
   console.log(`   guards: ≤${S.maxDailyTrades} trades/day · ≤${S.maxOpenPositions} open positions · ≥$${S.minLiquidityUsd} liquidity`);

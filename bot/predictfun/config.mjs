@@ -38,6 +38,29 @@ if (!["mainnet", "testnet"].includes(network)) {
   throw new Error(`PREDICT_ENV must be "mainnet" or "testnet", got "${network}"`);
 }
 
+const DEFAULT_BSC_RPCS = [
+  "https://bsc-dataseed.binance.org",
+  "https://bsc-dataseed1.binance.org",
+  "https://bsc-dataseed1.defibit.io",
+  "https://bsc.publicnode.com",
+  "https://binance.llamarpc.com",
+];
+
+function rpcList() {
+  const primary = str("BSC_RPC_URL", "");
+  const extra = str("BSC_RPC_FALLBACKS", "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const out = [];
+  for (const url of [primary, ...extra, ...DEFAULT_BSC_RPCS]) {
+    if (url && !out.includes(url)) out.push(url);
+  }
+  return out;
+}
+
+const bscRpcUrls = rpcList();
+
 const vikeyApiKey = str("VIKEY_API_KEY");
 const geminiApiKey = str("GEMINI_API_KEY");
 const vikeyModel = str("VIKEY_MODEL", "deepseek/deepseek-v4-flash");
@@ -78,7 +101,8 @@ export const config = {
 
   privateKey: str("PRIVY_WALLET_PRIVATE_KEY"),
   predictAccount: str("PREDICT_ACCOUNT_ADDRESS"),
-  bscRpcUrl: str("BSC_RPC_URL", "https://bsc-dataseed.binance.org"),
+  bscRpcUrl: bscRpcUrls[0],
+  bscRpcUrls,
 
   llmMode: llmMode === "auto" ? "auto" : llmMode,
   llmRotation: rotationOrder.length ? rotationOrder : ["vikey", "glm", "gemini"],
@@ -112,6 +136,11 @@ export const config = {
     minLiquidityUsd: num("MIN_LIQUIDITY_USD", 500),
     priceBandMin: num("PRICE_BAND_MIN", 0.05),
     priceBandMax: num("PRICE_BAND_MAX", 0.6),
+    cheapEdge: str("CHEAP_EDGE", "on").toLowerCase() !== "off",
+    cheapAskMax: num("CHEAP_ASK_MAX", 0.3),
+    cheapEdgeMin: num("CHEAP_EDGE_MIN", 0.2),
+    cheapEdgeStakePct: num("CHEAP_EDGE_STAKE_PCT", 12),
+    cheapTakeCents: num("CHEAP_TAKE_CENTS", 0.01),
     timezone: str("BOT_TIMEZONE", "Asia/Jakarta"),
     marketsPerCycle: num("MARKETS_PER_CYCLE", 3),
     scanIntervalSec: num("SCAN_INTERVAL_SEC", 120),
@@ -122,6 +151,11 @@ export const config = {
     maxAtrMult: num("MAX_ATR_MULT", 3.5),
     minIndicatorAgree: num("MIN_INDICATOR_AGREE", 3),
     minMlAgree: num("MIN_ML_AGREE", 2),
+    mtfGate: str("MTF_GATE", "on").toLowerCase() !== "off",
+    adxMin: num("ADX_MIN", 20),
+    atrPct5mMin: num("ATR_PCT_5M_MIN", 0.04),
+    atrPct5mMax: num("ATR_PCT_5M_MAX", 1.2),
+    minVolumeRatioBnb: num("MIN_VOLUME_RATIO_BNB", 1.0),
     bankrollLive: str("BANKROLL_LIVE", "on").toLowerCase() !== "off",
     baseStakePct: num("BASE_STAKE_PCT", 4),
     liveBankrollUsd: null,
@@ -135,6 +169,9 @@ export const config = {
 
   // One ledger per LLM so Gemini vs Vikey/DeepSeek can be compared fairly.
   stateFile: str("STATE_FILE") || `data/state-${llmProvider}.json`,
+  // Append-only log of every settled trade (all brains). Training data for
+  // the ML ensemble; never trimmed or reset by the bot.
+  tradesLog: str("TRADES_LOG", "data/trades.jsonl"),
 };
 
 export function applyLlmProvider(name) {

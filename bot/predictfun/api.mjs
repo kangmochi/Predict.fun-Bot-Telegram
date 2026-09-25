@@ -90,13 +90,25 @@ export async function createOrder(data) {
   return res.data;
 }
 
-export async function getMyOrders() {
-  const res = await request("GET", "/v1/orders", { auth: true });
+export async function getMyOrders({ status, first = 50 } = {}) {
+  const params = new URLSearchParams({ first: String(first) });
+  if (status) params.set("status", status);
+  const res = await request("GET", `/v1/orders?${params}`, { auth: true });
   return res.data ?? [];
 }
 
-export async function getPositions() {
-  const res = await request("GET", "/v1/positions", { auth: true });
+export async function getOrderByHash(hash) {
+  if (!hash) return null;
+  const res = await request("GET", `/v1/orders/${encodeURIComponent(hash)}`, { auth: true });
+  return res.data ?? null;
+}
+
+export async function getPositions({ marketId, first = 50, isResolved } = {}) {
+  const params = new URLSearchParams({ first: String(first) });
+  if (marketId != null && marketId !== "") params.set("marketId", String(marketId));
+  if (isResolved === true) params.set("isResolved", "true");
+  if (isResolved === false) params.set("isResolved", "false");
+  const res = await request("GET", `/v1/positions?${params}`, { auth: true });
   return res.data ?? [];
 }
 
